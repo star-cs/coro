@@ -122,6 +122,8 @@ Task get_return_object() // 用于构造协程（编译器生成调用代码）
 - `std::suspend_always`。暂停协程执行，执行权返回给调用者。
 - `std::suspend_never`。协程继续执行。
 
+> 备注：调用 对应的 协程函数，都会返回 子协程的task
+
 ### final_suspend (调度点)
 与 initial_suspend 类似，final_suspend 函数负责协程执行结束后的调度点逻辑，返回值同样是 awaiter 类型，用户可以通过自定义 awaiter 来转移执行权，也可以直接返回 std::suspend_alaways 或者 std::suspend_never  
 调用 final_suspend 会执行的逻辑
@@ -187,6 +189,8 @@ C++ 协程标准要求 awaiter 必须实现下列三个方法：
 用户代码执行 co_await awaiter 时，编译器首先执行 awaiter.await_ready 方法，该方法返回 bool 类型
 - 如果是 true，如同字面意思 ready 一样，代表当前协程已就绪，当前协程选择继续运行而非暂停，并且 await_suspend 方法不会被调用。
 - 反之，暂停运行，调用 awaiter.await_suspend
+
+> 补充：当父协程通过co_await等待子协程时：await_ready返回false，表示子协程未完成，父协程需挂起；
 
 ### await_suspend
 ```cpp
@@ -341,4 +345,217 @@ int io_uring_register(unsigned int fd, unsigned int opcode, void *arg, unsigned 
 
 # liburing 实战
 [liburing](./core_basic/04_io_uring.cc)
+
+
+# tinyCoroLab Lab1
+[tinyCoroLab/include/coro/task.hpp](./tinyCoroLab/include/coro/task.hpp)
+
+从四个关键点梳理
+## 1. 直接调用 协程函数 
+```cpp
+// 1. 分配协程帧内存
+void* frame = operator new(sizeof(coroutine_frame));
+
+// 2. 在帧中构造promise（使用默认构造函数）
+promise_type* promise = new (frame) promise_type();
+
+// 3. 在帧中存储协程参数
+int& i = *new (frame + offset) int(5);  // 存储参数值5
+
+// 4. 调用get_return_object获取Task对象
+Task task = promise->get_return_object();
+
+// 5. 处理初始挂起
+if (promise->initial_suspend().await_ready() == false) {
+    // 挂起协程（本例中返回suspend_always）
+    return task;  // 返回给调用者 (就类似于调用函数，task是返回值)
+}
+
+// 6. 如果未挂起，则开始执行协程函数体
+// ... 执行 run 的函数体 ...
+
+// 7. 挂起后，需要调用 task.resume() 恢复子协程运行~ 
+```
+
+## 2. co_return
+因为return_value和return_void不能同时存在。
+所以存在 类
+```cpp
+struct promise_base
+
+template<typename return_type>
+struct promise final : public promise_base, public container<return_type>
+// container<return_type> 模板类里实现了 return_value， result(返回co_return值)
+
+template<>
+struct promise<void> : public promise_base
+// 实现了 return_void
+```
+> co_return 的值保存在 container<return_type>，调用 promise.result() 获取。
+
+## 3. co_await
+子协程结束后 / 中断后，co_await task 调用 `auto operator co_await() const& noexcept` 的得到 `co_await awaitable{m_coroutine}` 。传入当前句柄。   
+> 所以，这里指向的 awaitable 操作的子协程句柄
+- await_ready 判断 协程句柄可用性。可用即接着调用await_suspend
+- await_suspend 此时，awaitable_base里保存的是子协程句柄，传参是awaiting_coroutine父协程句柄。（此时是绑定 父子协程关系的最佳时刻~）
+- await_resume 的调用时机 （补充）
+    - 若协程未挂起（即await_ready()返回true），await_resume会紧随await_ready()之后同步调用，协程继续执行而不暂停
+    - 若协程被挂起（即await_ready()返回false），则在后续通过coroutine_handle::resume()恢复协程时，​**恢复点之后的第一个操作就是调用await_resume**
+- await_resume 的返回值保存在 父协程的上下文中，不会被 co_return 覆盖
+
+```cpp
+
+struct awaitable_base
+{
+    awaitable_base(coroutine_handle coroutine) noexcept : m_coroutine(coroutine){}
+
+    auto await_ready() const noexcept -> bool { return !m_coroutine || m_coroutine.done(); }
+
+    auto await_suspend(std::coroutine_handle<> awaiting_coroutine) noexcept -> std::coroutine_handle<>
+    {
+        // TODO[lab1]: Add you codes
+        // 传入的 awaiting_coroutine 是 co_wait fun（子协程结束或suspend后）父协程的句柄
+        m_coroutine.promise().continuation(awaiting_coroutine);
+        return m_coroutine;
+    }
+    // struct awaitable继承后，co_await()里{}初始化已经赋值了，当前tast的句柄
+    std::coroutine_handle<promise_type> m_coroutine{nullptr};
+};
+
+auto operator co_await() const& noexcept
+{
+    struct awaitable : public awaitable_base
+    {
+        // 获取到 协程内 co_return 的返回值
+        auto await_resume() -> decltype(auto) { 
+            return this->m_coroutine.promise().result();    // 返回 co_return 的值
+        }
+    };
+    // 把当前句柄传入
+    return awaitable{m_coroutine};
+}
+```
+
+## promise_type 关键
+```cpp
+struct promise_base
+{
+    friend struct final_awaitable;
+    struct final_awaitable
+    {
+        // 挂起  接着调用 await_suspend
+        constexpr auto await_ready() const noexcept -> bool { return false; }
+        // 子协程结束的时候，返回父协程句柄
+        template<typename promise_type>
+        auto await_suspend(std::coroutine_handle<promise_type> coroutine) noexcept -> std::coroutine_handle<>
+        {
+            // coroutine 子协程
+            auto& promise = coroutine.promise();
+            return promise.m_continuation != nullptr ? promise.m_continuation : std::noop_coroutine();
+        }
+
+        constexpr auto await_resume() noexcept -> void {}
+    };
+
+    promise_base() noexcept = default;
+    ~promise_base()         = default;
+
+    constexpr auto initial_suspend() noexcept { return std::suspend_always{}; }
+
+    [[CORO_TEST_USED(lab1)]] auto final_suspend() noexcept
+    {
+        // TODO[lab1]: Add you codes
+        // Return suspend_always is incorrect,
+        // so you should modify the return type and define new awaiter to return
+        // 备注：每个调度点返回，会隐形调用 co_await awaitable(返回值)
+        return final_awaitable{}; 
+        // 此处 和 在父协程调用了 co_await 不同。
+        // 在子协程上下文执行 co_await final_awaitable，目的返回子协程的父协程句柄
+    }
+
+    auto continuation(std::coroutine_handle<> continuation) noexcept -> void { m_continuation = continuation; }
+
+    auto set_state(coro_state state) -> void { m_state = state; }
+
+    auto get_state() -> coro_state { return m_state; }
+
+    auto is_detach() -> bool { return m_state == coro_state::detach; }
+
+protected:
+    std::coroutine_handle<> m_continuation{nullptr};
+    coro_state              m_state{coro_state::normal};
+};
+
+template<typename return_type>
+struct promise final : public promise_base, public container<return_type>
+{
+public:
+    using task_type        = task<return_type>;
+    using coroutine_handle = std::coroutine_handle<promise<return_type>>;
+
+    promise() noexcept {}
+    promise(const promise&)             = delete;
+    promise(promise&& other)            = delete;
+    promise& operator=(const promise&)  = delete;
+    promise& operator=(promise&& other) = delete;
+    ~promise()                          = default;
+
+    auto get_return_object() noexcept -> task_type;
+
+    auto unhandled_exception() noexcept -> void { this->set_exception(); }
+};
+
+template<>
+struct promise<void> : public promise_base
+{
+    using task_type        = task<void>;
+    using coroutine_handle = std::coroutine_handle<promise<void>>;
+
+    promise() noexcept                  = default;
+    promise(const promise&)             = delete;
+    promise(promise&& other)            = delete;
+    promise& operator=(const promise&)  = delete;
+    promise& operator=(promise&& other) = delete;
+    ~promise()                          = default;
+
+    auto get_return_object() noexcept -> task_type;
+
+    constexpr auto return_void() noexcept -> void {}
+
+    auto unhandled_exception() noexcept -> void { m_exception_ptr = std::current_exception(); }
+
+    auto result() -> void
+    {
+        if (m_exception_ptr)
+        {
+            std::rethrow_exception(m_exception_ptr);
+        }
+    }
+
+private:
+    std::exception_ptr m_exception_ptr{nullptr};
+};
+
+```
+
+## 总结：
+- task里的 auto operator co_await() const& noexcept 需要一个 awaitable 保存 父子协程关系 以及 返回 co_return 返回值
+- task里的 promise_base 的 final_suspend 子协程结束的时候，需要 final_awaitable 返回 父协程句柄
+
+## 4. co_yield
+项目暂时没用到 ~ 
+
+## Task1 实现协程嵌套调用
+见上面的 梳理
+
+## Task2 task添加detach状态
+我暂时没理解为什么要这样
+看test文件的流程：
+
+```cpp
+auto p      = func0();
+auto handle = p.handle();   // 拿到task的协程句柄
+p.detach();                 // 句柄置为nullptr。task句柄放弃所有权
+clean(handle);              // 调用全局函数，handle.destroy();
+```
 
