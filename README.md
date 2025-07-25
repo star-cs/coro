@@ -295,7 +295,7 @@ Linux AIO 问题
 - 接口拓展性较差。
 
 # io_uring 实现原理
-io_uring 实现异步 I/O 的本质是利用了一个生产者 - 消费者模型，每个 uring 在初始化时会在内核中创建提交队列（sq）和完成队列（cq），其数据结构均为固定长度的环形缓冲区。用户向 sq 提交 I/O 任务，内核负责消费任务，完成后的任务会被放至 cq 中由用户取出，为了降低用户态与内核态之间的数据拷贝，io_uring 使用 mmap 让用户和内核共享 sq 与 cq 的内存空间。具体可以看下图所示：
+io_uring 实现异步 I/O 的本质是利用了一个生产者 - 消费者模型，每个 uring 在初始化时会在内核中创建提交队列（sq）和完成队列（cq），其数据结构均为固定长度的环形缓冲区。用户向 sq 提交 I/O 任务，内核负责消费任务，完成后的任务会被放至 cq 中由用户取出，为了降低用户态与内核态之间的数据拷贝，io_uring 使用 mmap 让用户和内核共享 sq 与 cq 的内存空间。具体可以看下图所示：  
 ![](./img/io_uring.png)
 
 从图中可以看出核心数据并不存储在 sq 中，而是存储在 sqe array 中，sqe array 包含多个 sqe entry（sqe），每个 sqe 是一个结构体存储了 I/O 请求的详细信息，比如操作类型、缓冲区地址、缓冲区长度和文件描述符等等，sq 只存储索引项，用户操作的完整流程包含如下步骤：
@@ -489,51 +489,13 @@ protected:
 template<typename return_type>
 struct promise final : public promise_base, public container<return_type>
 {
-public:
-    using task_type        = task<return_type>;
-    using coroutine_handle = std::coroutine_handle<promise<return_type>>;
-
-    promise() noexcept {}
-    promise(const promise&)             = delete;
-    promise(promise&& other)            = delete;
-    promise& operator=(const promise&)  = delete;
-    promise& operator=(promise&& other) = delete;
-    ~promise()                          = default;
-
-    auto get_return_object() noexcept -> task_type;
-
-    auto unhandled_exception() noexcept -> void { this->set_exception(); }
+    ...
 };
 
 template<>
 struct promise<void> : public promise_base
 {
-    using task_type        = task<void>;
-    using coroutine_handle = std::coroutine_handle<promise<void>>;
-
-    promise() noexcept                  = default;
-    promise(const promise&)             = delete;
-    promise(promise&& other)            = delete;
-    promise& operator=(const promise&)  = delete;
-    promise& operator=(promise&& other) = delete;
-    ~promise()                          = default;
-
-    auto get_return_object() noexcept -> task_type;
-
-    constexpr auto return_void() noexcept -> void {}
-
-    auto unhandled_exception() noexcept -> void { m_exception_ptr = std::current_exception(); }
-
-    auto result() -> void
-    {
-        if (m_exception_ptr)
-        {
-            std::rethrow_exception(m_exception_ptr);
-        }
-    }
-
-private:
-    std::exception_ptr m_exception_ptr{nullptr};
+    ...
 };
 
 ```
@@ -558,4 +520,8 @@ auto handle = p.handle();   // 拿到task的协程句柄
 p.detach();                 // 句柄置为nullptr。task句柄放弃所有权
 clean(handle);              // 调用全局函数，handle.destroy();
 ```
+
+# tinyCoroLab Lab2
+## Lab2a
+![](./img/engine.png)
 

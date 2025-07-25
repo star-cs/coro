@@ -60,6 +60,8 @@ class scheduler;
  */
 class context
 {
+    using stop_cb = std::function<void()>;
+
 public:
     context() noexcept;
     ~context() noexcept                = default;
@@ -92,6 +94,7 @@ public:
 
     inline auto submit_task(task<void>&& task) noexcept -> void
     {
+        // 传递右值，意味外部失去所有权，所以 task.detach();
         auto handle = task.handle();
         task.detach();
         this->submit_task(handle);
@@ -101,7 +104,7 @@ public:
 
     /**
      * @brief submit one task handle to context
-     *
+     * 外部调用
      * @param handle
      */
     [[CORO_TEST_USED(lab2b)]] auto submit_task(std::coroutine_handle<> handle) noexcept -> void;
@@ -137,6 +140,19 @@ public:
     [[CORO_TEST_USED(lab2b)]] auto run(stop_token token) noexcept -> void;
 
     // TODO[lab2b]: Add more function if you need
+    auto set_stop_cb(stop_cb cb) noexcept -> void { m_stop_cb = cb; }
+
+    // 驱动 engine 从任务队列取出任务并执行
+    auto process_work() noexcept -> void;
+
+    // 驱动 engine 执行 IO 任务
+    auto poll_work() noexcept -> void { m_engine.poll_submit(); }
+
+    // 判断是否没有 IO 任务以及引用计数是否为 0
+    auto empty_wait_task() noexcept -> bool
+    {
+        return m_num_wait_task.load(memory_order_acquire) == 0 && m_engine.empty_io();
+    }
 
 private:
     CORO_ALIGN engine   m_engine;
@@ -144,6 +160,8 @@ private:
     ctx_id              m_id;
 
     // TODO[lab2b]: Add more member variables if you need
+    atomic<size_t> m_num_wait_task{0};
+    stop_cb        m_stop_cb; // context 完成所有任务后应该执行的停止逻辑
 };
 
 inline context& local_context() noexcept

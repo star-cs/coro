@@ -247,7 +247,7 @@ TEST_P(SchedulerRunTaskTest, RunTask)
         submit_to_scheduler(mutex_func(m_vec, i, m_mtx));
     }
 
-    scheduler::loop();
+    scheduler::loop();      //  启动所有上下文
 
     ASSERT_EQ(m_vec.size(), task_num);
     std::sort(m_vec.begin(), m_vec.end());

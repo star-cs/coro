@@ -80,18 +80,19 @@ void io_cb_resume(io_info* info, int res)
 {
     auto num = reinterpret_cast<int*>(info->data);
     *num     = res;
-    detail::local_engine().submit_task(info->handle);
+    detail::local_engine().submit_task(info->handle); // 提交 协程句柄
 }
 
 struct test_noop_awaiter
 {
     test_noop_awaiter(detail::engine& engine, io_info& info, int* data) noexcept : m_engine(engine), m_info(info)
     {
+        // 其次提交 i/o任务
         m_sqe       = m_engine.get_free_urs();
         m_info.data = reinterpret_cast<uintptr_t>(data);
-        m_info.cb   = io_cb_resume;
+        m_info.cb   = io_cb_resume; // data = res 回调，并提交 协程句柄
 
-        io_uring_prep_nop(m_sqe);
+        io_uring_prep_nop(m_sqe); // ceq 返回 res=0
         io_uring_sqe_set_data(m_sqe, &m_info);
 
         m_engine.add_io_submit();
@@ -99,7 +100,11 @@ struct test_noop_awaiter
 
     constexpr auto await_ready() noexcept -> bool { return false; }
 
-    auto await_suspend(std::coroutine_handle<> handle) noexcept -> void { m_info.handle = handle; }
+    auto await_suspend(std::coroutine_handle<> handle) noexcept -> void
+    {
+        // 3. 把当前的 句柄保存到 io_info
+        m_info.handle = handle;
+    }
 
     constexpr auto await_resume() noexcept -> void {}
 
@@ -108,9 +113,17 @@ struct test_noop_awaiter
     coro::uring::ursptr m_sqe;
 };
 
+// 首先作为 任务存在
 task<> noop_io_task(detail::engine& engine, io_info& info, int* data)
 {
+    // 执行流程
+    // 1. engine 执行这个 句柄
+    // 2. 创建 test_noop_awaiter
     co_await test_noop_awaiter(engine, info, data);
+    // 3. 待外部engine submit后，m_sqe就能提交。
+    // 4. 待engine 得到 cqe entry 执行 data.cb(data, res);   //即执行 io_cb_resume
+    // 5. 执行 io_cb_resume 把 io_info.data = res = 0 ; 把 句柄作为 任务提交 engine
+    // 6. engine 恢复 句柄，重新 调用 test_noop_awaiter::await_resume，回到这里。
     co_return;
 }
 
@@ -130,19 +143,19 @@ TEST_F(EngineTest, InitStateCase)
 // test submit detach task but exec by user
 TEST_F(EngineTest, ExecOneDetachTaskByUser)
 {
-    auto task = func(m_vec, 1);
-    m_engine.submit_task(task.handle());
-    task.detach();
+    auto task = func(m_vec, 1);          // 不立即执行
+    m_engine.submit_task(task.handle()); // 提交任务到engine任务队列并唤醒engine，存放的是句柄，并不是 task<>
+    task.detach();                       // 放弃所有权，由用户处理
 
     ASSERT_TRUE(m_engine.ready());
     ASSERT_EQ(m_engine.num_task_schedule(), 1);
-    auto handle = m_engine.schedule();
+    auto handle = m_engine.schedule(); // 返回 task
     ASSERT_FALSE(m_engine.ready());
     ASSERT_EQ(m_engine.num_task_schedule(), 0);
-    handle.resume();
+    handle.resume(); // 恢复 task 运行
     ASSERT_EQ(m_vec.size(), 1);
     ASSERT_EQ(m_vec[0], 1);
-    handle.destroy();
+    handle.destroy(); // 外部 释放
 }
 
 // test submit many detach tasks but exec by user
@@ -319,17 +332,20 @@ TEST_P(EngineNopIOTest, AddBatchNopIO)
     {
         m_infos[i].data = reinterpret_cast<uintptr_t>(&m_vec[i]);
         m_infos[i].cb   = io_cb;
-        auto sqe        = m_engine.get_free_urs();
+        auto sqe        = m_engine.get_free_urs(); // 获取sqe entry
         ASSERT_NE(sqe, nullptr);
+        // io_uring_prep_nop(sqe)  准备提交的是
+        // ​空操作请求​（IORING_OP_NOP）。该操作不执行任何实际
+        // I/O（如读写文件或网络），仅由内核生成一个完成事件（CQE）返回用户态
         io_uring_prep_nop(sqe);
         io_uring_sqe_set_data(sqe, &m_infos[i]);
-        m_engine.add_io_submit();
+        m_engine.add_io_submit(); // 待提交任务数+1
     }
 
     do
     {
-        m_engine.poll_submit();
-    } while (!m_engine.empty_io());
+        m_engine.poll_submit(); // engine 主要函数，提交io，等待io，获取io结果，处理io结果
+    } while (!m_engine.empty_io()); // 只要 engine 不为空（待提交/待完成 任务还有）那么就 engine 阻塞 eventfd等待。
 
     for (int i = 0; i < task_num; i++)
     {
@@ -374,7 +390,7 @@ TEST_F(EngineTest, LastSubmitTaskToEngine)
     auto t1 = std::thread(
         [&]()
         {
-            m_engine.poll_submit();
+            m_engine.poll_submit(); // 没有任务，就 阻塞 eventfd
             m_vec[0] = 1;
             ASSERT_TRUE(m_engine.ready());
             ASSERT_EQ(m_engine.num_task_schedule(), 1);
@@ -385,7 +401,7 @@ TEST_F(EngineTest, LastSubmitTaskToEngine)
         {
             utils::msleep(100);
             m_vec[0] = 2;
-            m_engine.submit_task(task.handle());
+            m_engine.submit_task(task.handle()); // 提交任务，唤醒 engine
         });
     t1.join();
     t2.join();
@@ -403,8 +419,8 @@ TEST_F(EngineTest, FirstSubmitTaskToEngine)
         [&]()
         {
             utils::msleep(100);
-            m_engine.poll_submit();
-            m_vec[0] = 1;
+            m_engine.poll_submit(); // 没有 io 任务，就 阻塞 eventfd
+            m_vec[0] = 1;           // 唤醒后，但没有执行任务，所以是1不是0
             ASSERT_TRUE(m_engine.ready());
             ASSERT_EQ(m_engine.num_task_schedule(), 1);
             ASSERT_TRUE(m_engine.empty_io());
@@ -413,7 +429,7 @@ TEST_F(EngineTest, FirstSubmitTaskToEngine)
         [&]()
         {
             m_vec[0] = 2;
-            m_engine.submit_task(task.handle());
+            m_engine.submit_task(task.handle()); // 先提交任务
         });
     t1.join();
     t2.join();
@@ -462,19 +478,19 @@ TEST_F(EngineTest, SubmitTaskToEngineExecByEngine)
     auto t1 = std::thread(
         [&]()
         {
-            m_engine.poll_submit();
-            m_vec[0] = 1;
+            m_engine.poll_submit(); // 1
+            m_vec[0] = 1;           // 4 m_vec[1] = 1
             ASSERT_TRUE(m_engine.ready());
             ASSERT_EQ(m_engine.num_task_schedule(), 1);
             ASSERT_TRUE(m_engine.empty_io());
-            m_engine.exec_one_task();
+            m_engine.exec_one_task(); // 5 执行了句柄，m_vec[1] = 2
         });
     auto t2 = std::thread(
         [&]()
         {
             utils::msleep(100);
-            m_vec[0] = 2;
-            m_engine.submit_task(task.handle());
+            m_vec[0] = 2;                        // 2
+            m_engine.submit_task(task.handle()); // 3
         });
     t1.join();
     t2.join();
@@ -546,7 +562,7 @@ TEST_P(EngineMixTaskNopIOTest, MixTaskNopIO)
         {
             for (int i = 0; i < task_num; i++)
             {
-                auto task   = func(m_vec, nopio_num + i);
+                auto task   = func(m_vec, nopio_num + i); // puhs_back
                 auto handle = task.handle();
                 task.detach();
                 m_engine.submit_task(handle);
@@ -571,7 +587,8 @@ TEST_P(EngineMixTaskNopIOTest, MixTaskNopIO)
                 // io_uring_sqe_set_data(sqe, &m_infos[i]);
 
                 // m_engine.add_io_submit();
-                auto task   = noop_io_task(m_engine, m_infos[i], &(m_vec[i]));
+                auto task = noop_io_task(m_engine, m_infos[i], &(m_vec[i]));
+                // 分析后，最终 data m_vec[i] 会赋值为 res=0
                 auto handle = task.handle();
                 task.detach();
                 m_engine.submit_task(handle);
@@ -595,9 +612,10 @@ TEST_P(EngineMixTaskNopIOTest, MixTaskNopIO)
 
             int cnt = 0;
             // only all task been processed, poll thread will finish
+            // 提交一次noop_io_task任务，内部awaitable还会提交一次i/o任务，所以是2 * nopio_num
             while (cnt < 2 * nopio_num + task_num + 1)
             {
-                m_engine.poll_submit();
+                m_engine.poll_submit(); // 提交
                 while (m_engine.ready())
                 {
                     m_engine.exec_one_task();

@@ -54,7 +54,7 @@ public:
 
 /**
  * @brief round robin is an easy load balance algorithm
- *
+ * 轮询分发
  * @tparam
  */
 template<>

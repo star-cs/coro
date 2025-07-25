@@ -159,7 +159,7 @@ public:
     }
 
     /**
-     * @brief get the free uring sqe
+     * @brief get the free uring sqe 获取空闲的sqe
      *
      * @return ursptr
      */

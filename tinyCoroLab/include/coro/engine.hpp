@@ -28,7 +28,7 @@ class context;
 };
 
 /**
- * @brief Welcome to tinycoro lab2a, in this part you will build the heart of tinycoro����engine by
+ * @brief Welcome to tinycoro lab2a, in this part you will build the heart of tinycoro����engine by
  * modifing engine.hpp and engine.cpp, please ensure you have read the document of lab2a.
  *
  * @warning You should carefully consider whether each implementation should be thread-safe.
@@ -56,11 +56,24 @@ template<typename T>
 // multi producer and multi consumer queue
 using mpmc_queue = AtomicQueue<T>;
 
+#define wake_by_task(val) (((val) & engine::task_mask) > 0)
+#define wake_by_io(val)   (((val) & engine::io_mask) > 0)
+#define wake_by_cqe(val)  (((val) & engine::cqe_mask) > 0)
+
 class engine
 {
     friend class ::coro::context;
 
 public:
+    // 约定 eventfd 读出的 数字 对应实际发生的情况
+    static constexpr uint64_t task_mask = (0xFFFFF00000000000);
+    static constexpr uint64_t io_mask   = (0x00000FFFFF000000);
+    static constexpr uint64_t cqe_mask  = (0x0000000000FFFFFF);     // liburing完成任务后，往eventfd写入1
+
+    static constexpr uint64_t task_flag = (((uint64_t)1) << 44);
+    static constexpr uint64_t io_flag   = (((uint64_t)1) << 24);
+
+    // atomic.fetch_add 以不可分割的方式“读取-修改-写入”
     engine() noexcept { m_id = ginfo.engine_id.fetch_add(1, std::memory_order_relaxed); }
 
     ~engine() noexcept = default;
@@ -105,6 +118,7 @@ public:
     [[CORO_TEST_USED(lab2a)]] [[CORO_DISCARD_HINT]] auto schedule() noexcept -> coroutine_handle<>;
 
     /**
+     * 对外调用 提交任务
      * @brief submit one task handle to engine
      *
      * @param handle
@@ -128,9 +142,16 @@ public:
     /**
      * @brief submit uring sqe and wait uring finish, then handle
      * cqe entry by call handle_cqe_entry
-     *
+     * 最关键
      */
     [[CORO_TEST_USED(lab2a)]] auto poll_submit() noexcept -> void;
+
+    /**
+     * @brief write flag to eventfd to wake up thread blocked by read eventfd
+     *
+     * @param val
+     */
+    auto wake_up(uint64_t val = engine::task_flag) noexcept -> void;
 
     /**
      * @brief tell engine there has one io to be submitted, engine will record this
@@ -168,16 +189,24 @@ public:
     // TODO[lab2a]: Add more function if you need
 
 private:
+    // 提交io
+    auto do_io_submit() noexcept -> void;
+
+private:
     uint32_t    m_id;
     uring_proxy m_upxy;
 
     // store task handle
+    // 非 IO 任务
     mpmc_queue<coroutine_handle<>> m_task_queue; // You can replace it with another data structure
 
     // used to fetch cqe entry
+    // 取出完成块
     array<urcptr, config::kQueCap> m_urc;
 
     // TODO[lab2a]: Add more member variables if you need
+    size_t m_num_io_wait_submit{0}; // 当前待提交的 IO 数
+    size_t m_num_io_running{0};     // 正在运行且未完成的 IO 数
 };
 
 /**
