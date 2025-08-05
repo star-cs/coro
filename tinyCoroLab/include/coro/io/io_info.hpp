@@ -29,11 +29,11 @@ enum io_type
 
 struct io_info
 {
-    coroutine_handle<> handle;
-    int32_t            result;
-    io_type            type;
-    uintptr_t          data;
-    cb_type            cb;
+    coroutine_handle<> handle; // IO 绑定的协程句柄
+    int32_t            result; // IO 执行完的结果
+    io_type            type;   // IO 类型
+    uintptr_t          data;   // IO 绑定的内存区域
+    cb_type            cb;     // IO 绑定的回调函数
 };
 
 inline uintptr_t ioinfo_to_ptr(io_info* info) noexcept

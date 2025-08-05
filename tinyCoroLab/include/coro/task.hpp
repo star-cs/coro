@@ -268,7 +268,7 @@ public:
     [[CORO_TEST_USED(lab1)]] auto detach() -> void
     {
         // TODO[lab1]: Add you codes
-        assert(m_continuation != nullptr && "detach func expected no-nullptr coroutine_handler");
+        assert(m_coroutine != nullptr && "detach func expected no-nullptr coroutine_handler");
         auto& promise = m_coroutine.promise();
         promise.set_state(detail::coro_state::detach);
         m_coroutine = nullptr;  // 放弃所有权。通过外部调用 clean 清除

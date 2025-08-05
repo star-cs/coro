@@ -22,7 +22,10 @@ noop_awaiter::noop_awaiter() noexcept
 
 auto noop_awaiter::callback(io_info* data, int res) noexcept -> void
 {
-    data->result = res;
+    data->result = res; // 在 io_info 中设置返回值，之后在 io awaiter 的 await_resume 函数中返回
+
+    // 向当前上下文绑定的 context 提交协程句柄来恢复等待 io 的协程，
+    // 在长期运行模式下也可以调用 submit_to_scheduler
     submit_to_context(data->handle);
 }
 

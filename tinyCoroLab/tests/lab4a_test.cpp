@@ -51,13 +51,14 @@ task<> set_func(event<>& ev, std::atomic<int>& id, int* p)
 {
     auto guard = event_guard(ev);
     utils::msleep(100);
-    *p = id.fetch_add(1, std::memory_order_acq_rel) + 1;
+    *p = id.fetch_add(1, std::memory_order_acq_rel) + 1;   // fetch_add(1)，先返回当前值id，再将id+1，即 p=id旧值+1
     co_return;
+    // guard析构触发 m_ev.set();
 }
 
 task<> wait_func(event<>& ev, std::atomic<int>& id, int* p)
 {
-    co_await ev.wait();
+    co_await ev.wait(); // 调用 wait，把当前线程所在的contex和event保存起来，阻塞在此。
     *p = id.fetch_add(1, std::memory_order_acq_rel) + 1;
 }
 
